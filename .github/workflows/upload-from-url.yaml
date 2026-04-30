@@ -1,0 +1,211 @@
+name: Download file from URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "URL to download"
+        required: true
+        type: string
+      filename:
+        description: "Path/name to save as (e.g. files/app.apk, pages/site.html, paper.pdf)"
+        required: true
+        type: string
+      file_type:
+        description: "Optional type check after download"
+        required: true
+        default: "any"
+        type: choice
+        options:
+          - any
+          - pdf
+          - apk
+          - html
+          - audio
+          - image
+          - video
+          - archive
+          - text
+      storage:
+        description: "Where to put the downloaded file"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - repo
+          - artifact
+          - both
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FILE_URL: ${{ inputs.file_url }}
+      OUTPUT_PATH: ${{ inputs.filename }}
+      FILE_TYPE: ${{ inputs.file_type }}
+      STORAGE: ${{ inputs.storage }}
+      # GitHub blocks normal Git pushes containing files larger than 100 MiB.
+      # Keep auto-mode comfortably below that and use artifacts for big files.
+      REPO_SOFT_LIMIT_BYTES: "52428800"
+      REPO_HARD_LIMIT_BYTES: "100000000"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validate requested path
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$OUTPUT_PATH" ]]; then
+            echo "filename cannot be empty" >&2
+            exit 1
+          fi
+
+          if [[ "$OUTPUT_PATH" = /* || "$OUTPUT_PATH" == *$'\n'* || "$OUTPUT_PATH" == *$'\r'* ]]; then
+            echo "filename must be a relative path without newlines" >&2
+            exit 1
+          fi
+
+          if [[ "$(basename "$OUTPUT_PATH")" == -* || "$OUTPUT_PATH" == *"*"* || "$OUTPUT_PATH" == *"?"* || "$OUTPUT_PATH" == *"["* ]]; then
+            echo "filename cannot start with '-' or contain glob characters (* ? [)" >&2
+            exit 1
+          fi
+
+          if [[ "$OUTPUT_PATH" == ".git" || "$OUTPUT_PATH" == .git/* || "$OUTPUT_PATH" == *"/.git/"* ]]; then
+            echo "filename cannot write inside .git" >&2
+            exit 1
+          fi
+
+          if [[ "$OUTPUT_PATH" == ".." || "$OUTPUT_PATH" == ../* || "$OUTPUT_PATH" == */../* || "$OUTPUT_PATH" == */.. ]]; then
+            echo "filename cannot contain '..' path traversal" >&2
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$OUTPUT_PATH")"
+
+      - name: Download URL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --output "$OUTPUT_PATH" \
+            "$FILE_URL"
+
+      - name: Inspect and validate file
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          size_bytes="$(wc -c < "$OUTPUT_PATH" | tr -d ' ')"
+          mime_type="$(file --mime-type -b -- "$OUTPUT_PATH" || echo application/octet-stream)"
+          file_description="$(file -b -- "$OUTPUT_PATH" || true)"
+
+          echo "path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
+          echo "size_bytes=$size_bytes" >> "$GITHUB_OUTPUT"
+          echo "mime_type=$mime_type" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Downloaded file"
+            echo
+            echo "- Path: \`$OUTPUT_PATH\`"
+            echo "- Size: $size_bytes bytes"
+            echo "- MIME type: \`$mime_type\`"
+            echo "- Description: \`$file_description\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "First 32 bytes:"
+          xxd -l 32 "$OUTPUT_PATH" || true
+          echo
+          echo "file output:"
+          file -- "$OUTPUT_PATH" || true
+
+          case "$FILE_TYPE" in
+            any)
+              ;;
+            pdf)
+              [[ "$mime_type" == "application/pdf" ]]
+              ;;
+            apk)
+              # APKs are ZIP containers and may be reported as application/zip.
+              [[ "$mime_type" == "application/vnd.android.package-archive" || "$mime_type" == "application/zip" || "$file_description" == *"Zip archive data"* ]]
+              ;;
+            html)
+              [[ "$mime_type" == "text/html" || "$mime_type" == "application/xhtml+xml" ]]
+              ;;
+            audio)
+              [[ "$mime_type" == audio/* ]]
+              ;;
+            image)
+              [[ "$mime_type" == image/* ]]
+              ;;
+            video)
+              [[ "$mime_type" == video/* ]]
+              ;;
+            archive)
+              [[ "$mime_type" == "application/zip" || "$mime_type" == "application/x-tar" || "$mime_type" == "application/gzip" || "$mime_type" == "application/x-gzip" || "$mime_type" == "application/x-7z-compressed" || "$mime_type" == "application/x-rar" || "$mime_type" == "application/x-xz" || "$file_description" == *"archive"* || "$file_description" == *"compressed"* ]]
+              ;;
+            text)
+              [[ "$mime_type" == text/* || "$mime_type" == "application/json" || "$mime_type" == "application/xml" || "$mime_type" == "application/javascript" ]]
+              ;;
+            *)
+              echo "Unsupported file_type: $FILE_TYPE" >&2
+              exit 1
+              ;;
+          esac || {
+            echo "Downloaded file did not match expected type '$FILE_TYPE' (MIME: $mime_type)." >&2
+            exit 1
+          }
+
+          if (( size_bytes <= REPO_SOFT_LIMIT_BYTES )); then
+            echo "repo_safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo_safe=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        if: ${{ inputs.storage == 'artifact' || inputs.storage == 'both' || (inputs.storage == 'auto' && steps.inspect.outputs.repo_safe == 'false') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-file
+          path: ${{ steps.inspect.outputs.path }}
+          if-no-files-found: error
+
+      - name: Commit file to repo
+        if: ${{ inputs.storage == 'repo' || inputs.storage == 'both' || (inputs.storage == 'auto' && steps.inspect.outputs.repo_safe == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          size_bytes="${{ steps.inspect.outputs.size_bytes }}"
+          if (( size_bytes >= REPO_HARD_LIMIT_BYTES )); then
+            echo "Refusing to commit $size_bytes-byte file: GitHub blocks files larger than 100 MB." >&2
+            echo "Run again with storage=artifact, or use storage=auto so large files become workflow artifacts." >&2
+            exit 1
+          fi
+
+          if (( size_bytes > REPO_SOFT_LIMIT_BYTES )); then
+            echo "::warning::This file is larger than 50 MiB. GitHub recommends using releases or artifacts instead of committing large binaries."
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- "$OUTPUT_PATH"
+          git commit -m "Add downloaded file: $OUTPUT_PATH" -m "Source URL: $FILE_URL" || {
+            echo "No changes to commit"
+            exit 0
+          }
+          git push
